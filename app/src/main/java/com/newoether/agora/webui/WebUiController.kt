@@ -28,17 +28,9 @@ internal sealed interface WebUiStatus {
     data object Stopped : WebUiStatus
     data object Starting : WebUiStatus
     data class Running(val port: Int, val https: Boolean) : WebUiStatus
-    /** The server could not start, typically because the port is in use. */
     data class Failed(val message: String) : WebUiStatus
 }
 
-/**
- * Binds and starts the server, returning once it listens.
- *
- * Deliberately a plain function: inside a coroutine body, `embeddedServer` resolves to Ktor's
- * `CoroutineScope.embeddedServer`, which makes the server a child of that coroutine, so the
- * enclosing `withContext` would never return while the server runs.
- */
 internal fun startWebUiEngine(
     port: Int,
     routes: WebUiServer,
@@ -48,7 +40,6 @@ internal fun startWebUiEngine(
     embeddedServer(
         CIO,
         configure = {
-            // The first connector takes [port]; each extra one takes a subsequent ephemeral port.
             connectors.clear()
             connectors.add(connector { this.port = port; this.host = host })
             repeat(extraConnectors) { connectors.add(connector { this.port = 0; this.host = host }) }
@@ -56,7 +47,6 @@ internal fun startWebUiEngine(
         },
     ) { routes.install(this) }
 
-/** Controls the local HTTP/HTTPS WebUI server and exposes connection status. */
 internal class WebUiController(
     private val context: Context,
     private val scope: CoroutineScope,
@@ -65,20 +55,15 @@ internal class WebUiController(
 ) {
     private val _status = MutableStateFlow<WebUiStatus>(WebUiStatus.Stopped)
     val status: StateFlow<WebUiStatus> = _status.asStateFlow()
-
     private val transitionMutex = Mutex()
     private var server: EmbeddedServer<*, *>? = null
 
     fun start(): Flow<WebUiStatus> = _status.map { it }
 
     suspend fun startIfEnabled(): WebUiStatus {
-        val settings = context.applicationContext
-            .let { app -> app.getSharedPreferences("settings", Context.MODE_PRIVATE) }
-        val enabled = settings.getBoolean("webui_enabled", false)
-        if (!enabled) return WebUiStatus.Stopped
-        val port = settings.getInt("webui_port", 8765)
-        val useHttps = settings.getBoolean("webui_https", true)
-        return startServer(port, useHttps)
+        val settings = context.applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        if (!settings.getBoolean("webui_enabled", false)) return WebUiStatus.Stopped
+        return startServer(settings.getInt("webui_port", 8765), settings.getBoolean("webui_https", true))
     }
 
     suspend fun startServer(port: Int, useHttps: Boolean): WebUiStatus = transitionMutex.withLock {
@@ -90,23 +75,19 @@ internal class WebUiController(
         _status.value = WebUiStatus.Starting
         val existing = server
         if (existing != null) {
-            try {
-                withContext(Dispatchers.IO) { existing.stop(100, 500) }
-            } catch (_: Exception) { /* ignore stop failure */ }
+            try { withContext(Dispatchers.IO) { existing.stop(100, 500) } } catch (_: Exception) { }
             server = null
         }
         try {
-            val routes = WebUiServer(context.applicationContext, useHttps)
-            val candidate = serverFactory(port, routes, ANY_HOST, EXTRA_CONNECTORS)
+            val candidate = serverFactory(port, WebUiServer(context.applicationContext, useHttps), ANY_HOST, EXTRA_CONNECTORS)
             withContext(Dispatchers.IO) { candidate.start(wait = true) }
             server = candidate
-            val running = WebUiStatus.Running(port, useHttps)
-            _status.value = running
-            running
+            WebUiStatus.Running(port, useHttps).also { _status.value = it }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (error: Exception) {
-            val message = error.message ?: error.javaClass.simpleName
+            val failed = WebUiStatus.Failed(error.message ?: error.javaClass.simpleName)
             DebugLog.e(TAG, "Failed to start WebUI", error)
-            val failed = WebUiStatus.Failed(message)
             _status.value = failed
             failed
         }
@@ -116,20 +97,17 @@ internal class WebUiController(
         val existing = server
         server = null
         if (existing != null) {
-            try {
-                withContext(Dispatchers.IO) { existing.stop(100, 500) }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                DebugLog.e(TAG, "Failed to stop WebUI", error)
-            }
+            try { withContext(Dispatchers.IO) { existing.stop(100, 500) } }
+            catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (error: Exception) { DebugLog.e(TAG, "Failed to stop WebUI", error) }
         }
-        _status.value = WebUiStatus.Stopped
-        WebUiStatus.Stopped
+        WebUiStatus.Stopped.also { _status.value = it }
     }
 
     suspend fun close() {
-        try { stopServer() } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled } catch (_: Exception) { /* shutdown best-effort */ }
+        try { stopServer() }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: Exception) { }
     }
 
     companion object {
