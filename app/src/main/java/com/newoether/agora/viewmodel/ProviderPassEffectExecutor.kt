@@ -61,6 +61,8 @@ internal class ProviderPassEffectExecutor(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
+            // Runner normally closes failures into an outcome. A consumer failure must still close
+            // the exact Running pass so the mailbox never retains a phantom Provider operation.
             callbacks.returnConsumerFailure(startEffect.identity, ProviderPassResult.FAILED)
             throw error
         }
