@@ -116,4 +116,171 @@ fun WelcomeScreen(
         }
     }
 
-    // ...SENTINEL_REQUIRES_REMAINDER...
+    HorizontalPager(
+        state = pagerState,
+        modifier = Modifier.fillMaxSize(),
+        userScrollEnabled = false,
+    ) { page ->
+        when (page) {
+            PAGE_WELCOME -> WelcomePage(onGetStarted = { scope.launch { pagerState.animateScrollToPage(PAGE_PROVIDER_CONFIG) } })
+            PAGE_PROVIDER_CONFIG -> ProviderConfigPage(
+                viewModel = viewModel,
+                preferencesManager = preferencesManager,
+                initialProvider = selectedProvider,
+                onProviderSelected = { selectedProvider = it },
+                onApiKeyChanged = { apiKey = it },
+                onContinue = { scope.launch { pagerState.animateScrollToPage(PAGE_MODEL_CONFIG) } },
+                onBack = { scope.launch { pagerState.animateScrollToPage(PAGE_WELCOME) } },
+            )
+            PAGE_MODEL_CONFIG -> ModelConfigPage(
+                viewModel = viewModel,
+                isFetching = isFetchingModels,
+                selectedModel = selectedModel,
+                onModelSelected = { selectedModel = it },
+                onContinue = {
+                    if (selectedProvider != null) {
+                        scope.launch {
+                            preferencesManager.setSelectedModel(selectedProvider!!, selectedModel)
+                            pagerState.animateScrollToPage(PAGE_COMPLETE)
+                        }
+                    }
+                },
+                onBack = { scope.launch { pagerState.animateScrollToPage(PAGE_PROVIDER_CONFIG) } },
+            )
+            PAGE_COMPLETE -> CompletionPage(
+                skipWelcome = skipWelcome,
+                onSkipWelcomeChanged = { skipWelcome = it },
+                onFinish = {
+                    scope.launch {
+                        preferencesManager.setWelcomeSkipped(skipWelcome)
+                        onFinish()
+                    }
+                },
+                onBack = { scope.launch { pagerState.animateScrollToPage(PAGE_MODEL_CONFIG) } },
+            )
+        }
+    }
+}
+
+@Composable
+private fun WelcomePage(onGetStarted: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text("Welcome to Agora", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(16.dp))
+        Text("Your private AI assistant", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(32.dp))
+        Button(onClick = onGetStarted) { Text("Get started") }
+    }
+}
+
+@Composable
+private fun ProviderConfigPage(
+    viewModel: ChatViewModel,
+    preferencesManager: PreferencesManager,
+    initialProvider: String?,
+    onProviderSelected: (String) -> Unit,
+    onApiKeyChanged: (String) -> Unit,
+    onContinue: () -> Unit,
+    onBack: () -> Unit,
+) {
+    var provider by remember { mutableStateOf(initialProvider ?: Constants.PROVIDER_OPENAI) }
+    var key by remember { mutableStateOf("") }
+    var showKey by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(provider) {
+        onProviderSelected(provider)
+        key = preferencesManager.getApiKey(provider) ?: ""
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Configure provider", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(24.dp))
+        listOf(Constants.PROVIDER_OPENAI, Constants.PROVIDER_ANTHROPIC, Constants.PROVIDER_GEMINI, Constants.PROVIDER_OPENROUTER).forEach { item ->
+            Row(Modifier.fillMaxWidth().clickable { provider = item }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = provider == item, onClick = { provider = item })
+                Text(item)
+            }
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(if (showKey) key else "•".repeat(key.length), modifier = Modifier.weight(1f))
+            Switch(checked = showKey, onCheckedChange = { showKey = it })
+        }
+        androidx.compose.material3.OutlinedTextField(
+            value = key,
+            onValueChange = { key = it; onApiKeyChanged(it) },
+            label = { Text("API key") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+        )
+        Spacer(Modifier.height(24.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Button(onClick = onBack) { Text("Back") }
+            Button(onClick = {
+                scope.launch {
+                    preferencesManager.setApiKey(provider, key)
+                    onContinue()
+                }
+            }) { Text("Continue") }
+        }
+    }
+}
+
+@Composable
+private fun ModelConfigPage(
+    viewModel: ChatViewModel,
+    isFetching: Boolean,
+    selectedModel: String,
+    onModelSelected: (String) -> Unit,
+    onContinue: () -> Unit,
+    onBack: () -> Unit,
+) {
+    val models by viewModel.availableModels.collectAsState(initial = emptyList())
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Choose a model", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        if (isFetching) CircularProgressIndicator()
+        models.forEach { model ->
+            Row(Modifier.fillMaxWidth().clickable { onModelSelected(model) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = selectedModel == model, onClick = { onModelSelected(model) })
+                Text(model)
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Button(onClick = onBack) { Text("Back") }
+            Button(onClick = onContinue) { Text("Continue") }
+        }
+    }
+}
+
+@Composable
+private fun CompletionPage(skipWelcome: Boolean, onSkipWelcomeChanged: (Boolean) -> Unit, onFinish: () -> Unit, onBack: () -> Unit) {
+    Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Text("You're all set", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Skip welcome next time", modifier = Modifier.weight(1f))
+            Switch(checked = skipWelcome, onCheckedChange = onSkipWelcomeChanged)
+        }
+        Spacer(Modifier.height(24.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Button(onClick = onBack) { Text("Back") }
+            Button(onClick = onFinish) { Text("Finish") }
+        }
+    }
+}
+
+private const val PAGE_WELCOME = 0
+private const val PAGE_PROVIDER_CONFIG = 1
+private const val PAGE_MODEL_CONFIG = 2
+private const val PAGE_COMPLETE = 3
+private const val PAGE_COUNT = 4
