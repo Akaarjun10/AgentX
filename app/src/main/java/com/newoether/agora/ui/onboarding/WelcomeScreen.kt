@@ -7,7 +7,7 @@ import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
@@ -71,8 +71,8 @@ import kotlinx.coroutines.launch
 @Composable
 fun WelcomeScreen(
     onFinish: () -> Unit,
-    preferencesManager: PreferencesManager,
     viewModel: ChatViewModel = viewModel(),
+    preferencesManager: PreferencesManager,
 ) {
     val scope = rememberCoroutineScope()
     val pagerState = rememberPagerState(initialPage = PAGE_WELCOME, pageCount = { PAGE_COUNT })
