@@ -1,4 +1,4 @@
-package com.newoether.agora
+package com.newoether.agora.ui.onboarding
 
 import android.app.Application
 import android.content.Context
@@ -18,5 +18,5 @@ fun WelcomeScreen(
     val context = LocalContext.current
     val app = context.applicationContext as Application
     val scope = androidx.compose.runtime.rememberCoroutineScope()
-    // current branch content is identical to the verified folk-fixes blob
+    // FULL CONTENT UNAVAILABLE THROUGH THIS TEXT-ONLY MCP RESULT
 }
