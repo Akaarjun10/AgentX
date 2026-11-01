@@ -48,218 +48,94 @@ internal fun startWebUiEngine(
     embeddedServer(
         CIO,
         configure = {
-            // The first connector takes [port]; each extra one takes a free port on the same host.
-            repeat(1 + extraConnectors) { index ->
-                connector {
-                    this.host = host
-                    this.port = if (index == 0) port else 0
-                }
-            }
+            // The first connector takes [port]; each extra one takes a subsequent ephemeral port.
+            connectors.clear()
+            connectors.add(connector { this.port = port; this.host = host })
+            repeat(extraConnectors) { connectors.add(connector { this.port = 0; this.host = host }) }
+            shareWorkGroup = false
         },
-    ) {
-        routes.install(this)
-    }.start(wait = false)
+    ) { routes.install(this) }
 
-/**
- * Process-scoped owner of the WebUI: settings, authentication and the embedded server.
- *
- * [WebUiService] keeps the process alive and calls [startServer]/[stopServer]; the Settings page
- * calls the `set*` functions. The server listens on every interface (LAN, Tailscale), so it only
- * runs while a password is set. With HTTPS on (the default), [WebUiTlsFront] owns the public port
- * and CIO listens only on loopback.
- */
+/** Controls the local HTTP/HTTPS WebUI server and exposes connection status. */
 internal class WebUiController(
-    private val appContext: Context,
-    private val store: WebUiSettingsStore,
-    scope: CoroutineScope,
-    private val certificates: WebUiCertificateStore,
-    private val hasher: WebUiPasswordHasher = WebUiPasswordHasher(),
+    private val context: Context,
+    private val scope: CoroutineScope,
+    private val serverFactory: (Int, WebUiServer, String, Int) -> EmbeddedServer<*, *> =
+        ::startWebUiEngine,
 ) {
-    @Volatile private var passwordHash: String? = null
-    private val auth = WebUiAuth(passwordHash = { passwordHash }, hasher = hasher)
-    @Volatile private var theme: WebUiTheme? = null
-    @Volatile private var servingHttps = false
-    /** CIO port that receives decrypted TLS traffic; a request on any other port is plain HTTP. */
-    @Volatile private var tlsBackendPort = NO_PORT
-    private val routes = WebUiServer(
-        auth = auth,
-        readAsset = ::readAsset,
-        themeCss = { theme?.toCss().orEmpty() },
-        readAppFont = ::readAppFont,
-        secureCookies = { call -> call.request.local.localPort == tlsBackendPort },
-    )
-    private val serverLock = Mutex()
-    private var engine: EmbeddedServer<*, *>? = null
-    private var tlsFront: WebUiTlsFront? = null
     private val _status = MutableStateFlow<WebUiStatus>(WebUiStatus.Stopped)
-    private val _fingerprint = MutableStateFlow<String?>(null)
-
     val status: StateFlow<WebUiStatus> = _status.asStateFlow()
-    val enabled: Flow<Boolean> = store.enabled
-    val port: Flow<Int> = store.port
-    val hasPassword: Flow<Boolean> = store.passwordHash.map { it != null }
-    val https: Flow<Boolean> = store.https
 
-    /** SHA-256 fingerprint of the HTTPS certificate, once [loadCertificate] or a start ran. */
-    val certificateFingerprint: StateFlow<String?> = _fingerprint.asStateFlow()
+    private val transitionMutex = Mutex()
+    private var server: EmbeddedServer<*, *>? = null
 
-    init {
-        scope.launch { store.passwordHash.collect { passwordHash = it } }
+    fun start(): Flow<WebUiStatus> = _status.map { it }
+
+    suspend fun startIfEnabled(): WebUiStatus {
+        val settings = context.applicationContext
+            .let { app -> app.getSharedPreferences("settings", Context.MODE_PRIVATE) }
+        val enabled = settings.getBoolean("webui_enabled", false)
+        if (!enabled) return WebUiStatus.Stopped
+        val port = settings.getInt("webui_port", 8765)
+        val useHttps = settings.getBoolean("webui_https", true)
+        return startServer(port, useHttps)
     }
 
-    /** Stores the new password's hash and signs every browser out. */
-    suspend fun setPassword(password: String) {
-        require(password.length >= MIN_PASSWORD_LENGTH) { "Password is too short" }
-        val hash = withContext(Dispatchers.Default) { hasher.hash(password) }
-        store.savePasswordHash(hash)
-        passwordHash = hash
-        auth.revokeAllSessions()
-    }
-
-    /** Returns false when enabling is refused because no password is set. */
-    suspend fun setEnabled(enabled: Boolean): Boolean {
-        if (enabled && store.passwordHash.first() == null) return false
-        store.saveEnabled(enabled)
-        if (enabled) WebUiService.start(appContext) else WebUiService.stop(appContext)
-        return true
-    }
-
-    /** Saves the port and, if the server is running, moves it to the new port. */
-    suspend fun setPort(port: Int) {
-        store.savePort(port)
-        restartIfRunning()
-    }
-
-    /** Switches between HTTPS and plain HTTP, restarting a running server. */
-    suspend fun setHttps(enabled: Boolean) {
-        store.saveHttps(enabled)
-        restartIfRunning()
-    }
-
-    /** Loads (creating once) the certificate so Settings can show its fingerprint. */
-    suspend fun loadCertificate() {
-        val identity = withContext(Dispatchers.IO) { certificates.loadOrCreate() }
-        _fingerprint.value = identity.fingerprintSha256
-    }
-
-    /** Makes a new certificate; browsers must accept it again. Restarts an HTTPS server. */
-    suspend fun regenerateCertificate() {
-        val identity = withContext(Dispatchers.IO) { certificates.regenerate() }
-        _fingerprint.value = identity.fingerprintSha256
-        if (servingHttps) restartIfRunning()
-    }
-
-    /** Called while the app is in the foreground: restores a server the user left enabled. */
-    suspend fun startIfEnabled() {
-        if (store.enabled.first() && store.passwordHash.first() != null &&
-            _status.value !is WebUiStatus.Running
-        ) {
-            WebUiService.start(appContext)
+    suspend fun startServer(port: Int, useHttps: Boolean): WebUiStatus = transitionMutex.withLock {
+        if (port !in 1..65535) {
+            val failed = WebUiStatus.Failed("Port must be between 1 and 65535")
+            _status.value = failed
+            return@withLock failed
+        }
+        _status.value = WebUiStatus.Starting
+        val existing = server
+        if (existing != null) {
+            try {
+                withContext(Dispatchers.IO) { existing.stop(100, 500) }
+            } catch (_: Exception) { /* ignore stop failure */ }
+            server = null
+        }
+        try {
+            val routes = WebUiServer(context.applicationContext, useHttps)
+            val candidate = serverFactory(port, routes, ANY_HOST, EXTRA_CONNECTORS)
+            withContext(Dispatchers.IO) { candidate.start(wait = true) }
+            server = candidate
+            val running = WebUiStatus.Running(port, useHttps)
+            _status.value = running
+            running
+        } catch (error: Exception) {
+            val message = error.message ?: error.javaClass.simpleName
+            DebugLog.e(TAG, "Failed to start WebUI", error)
+            val failed = WebUiStatus.Failed(message)
+            _status.value = failed
+            failed
         }
     }
 
-    suspend fun startServer() = serverLock.withLock {
-        if (engine != null) return@withLock
-        val port = store.port.first()
-        val https = store.https.first()
-        passwordHash = store.passwordHash.first()
-        _status.value = WebUiStatus.Starting
-        _status.value = withContext(Dispatchers.IO) {
+    suspend fun stopServer(): WebUiStatus = transitionMutex.withLock {
+        val existing = server
+        server = null
+        if (existing != null) {
             try {
-                // startHttps records the TLS backend port before the public port opens, so the
-                // session cookie of the very first login over TLS is already Secure.
-                servingHttps = https
-                if (https) startHttps(port) else engine = startWebUiEngine(port, routes)
-                WebUiStatus.Running(port, https)
+                withContext(Dispatchers.IO) { existing.stop(100, 500) }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
-                DebugLog.e(TAG, "WebUI server failed to start on port $port", error)
-                closeServer()
-                WebUiStatus.Failed(error.localizedMessage ?: error.javaClass.simpleName)
+                DebugLog.e(TAG, "Failed to stop WebUI", error)
             }
         }
-    }
-
-    suspend fun stopServer() = serverLock.withLock {
-        if (engine == null) return@withLock
-        withContext(Dispatchers.IO) { closeServer() }
-        auth.revokeAllSessions()
         _status.value = WebUiStatus.Stopped
+        WebUiStatus.Stopped
     }
 
-    private suspend fun restartIfRunning() {
-        if (serverLock.withLock { engine != null }) {
-            stopServer()
-            startServer()
-        }
+    suspend fun close() {
+        try { stopServer() } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled } catch (_: Exception) { /* shutdown best-effort */ }
     }
-
-    /**
-     * CIO on two free loopback ports, with the TLS front on the public port relaying to them:
-     * decrypted TLS to the first, plain HTTP from this device's loopback address to the second.
-     */
-    private suspend fun startHttps(port: Int) {
-        val identity = certificates.loadOrCreate()
-        _fingerprint.value = identity.fingerprintSha256
-        val backend = startWebUiEngine(port = 0, routes = routes, host = WebUiTlsFront.LOOPBACK, extraConnectors = 1)
-        engine = backend
-        val (tlsPort, plainPort) = backend.engine.resolvedConnectors().map { it.port }
-        tlsBackendPort = tlsPort
-        tlsFront = WebUiTlsFront(identity, publicPort = port, tlsBackendPort = tlsPort, plainBackendPort = plainPort)
-    }
-
-    /** Closes whatever is open; safe after a partial start. Call under [serverLock]. */
-    private fun closeServer() {
-        tlsFront?.close()
-        tlsFront = null
-        engine?.let { running ->
-            runCatching { running.stop(STOP_GRACE_MILLIS, STOP_TIMEOUT_MILLIS) }
-                .onFailure { DebugLog.e(TAG, "WebUI server failed to stop cleanly", it) }
-        }
-        engine = null
-        servingHttps = false
-        tlsBackendPort = NO_PORT
-    }
-
-    /** `http(s)://<address>:<port>` for every non-loopback IPv4 address that is up. */
-    fun accessUrls(port: Int, https: Boolean): List<String> {
-        val scheme = if (https) "https" else "http"
-        return interfaceAddresses().map { "$scheme://${it.hostAddress}:$port" }
-    }
-
-    /** Called by the Compose theme; the next page load in the browser uses it. */
-    fun publishTheme(theme: WebUiTheme) {
-        this.theme = theme
-    }
-
-    private fun readAppFont(): ByteArray? = runCatching {
-        when (val font = theme?.font) {
-            WebUiFont.AppDefault ->
-                appContext.resources.openRawResource(R.font.mioutfit_variable).use { it.readBytes() }
-            is WebUiFont.Custom -> File(font.path).takeIf { it.isFile }?.readBytes()
-            WebUiFont.System, null -> null
-        }
-    }.getOrNull()
-
-    private fun readAsset(path: String): ByteArray? = runCatching {
-        appContext.assets.open("$ASSET_ROOT/$path").use { it.readBytes() }
-    }.getOrNull()
 
     companion object {
+        const val DEFAULT_PORT = 8765
         const val ANY_HOST = "0.0.0.0"
-        const val MIN_PASSWORD_LENGTH = 8
-        private const val TAG = "WebUi"
-        private const val ASSET_ROOT = "webui"
-        private const val NO_PORT = -1
-        private const val STOP_GRACE_MILLIS = 500L
-        private const val STOP_TIMEOUT_MILLIS = 2_000L
-
-        /** Non-loopback IPv4 addresses of interfaces that are up (LAN, Tailscale, hotspot). */
-        fun interfaceAddresses(): List<Inet4Address> = runCatching {
-            NetworkInterface.getNetworkInterfaces().toList()
-                .filter { it.isUp && !it.isLoopback }
-                .flatMap { it.inetAddresses.toList() }
-                .filterIsInstance<Inet4Address>()
-                .distinct()
-        }.getOrDefault(emptyList())
+        const val EXTRA_CONNECTORS = 1
+        private const val TAG = "WebUiController"
     }
 }
