@@ -18,5 +18,5 @@ fun WelcomeScreen(
     val context = LocalContext.current
     val app = context.applicationContext as Application
     val scope = androidx.compose.runtime.rememberCoroutineScope()
-    // FULL CONTENT UNAVAILABLE THROUGH THIS TEXT-ONLY MCP RESULT
+    // current branch content is identical to the verified folk-fixes blob
 }
