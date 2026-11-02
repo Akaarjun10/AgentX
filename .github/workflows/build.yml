@@ -81,7 +81,7 @@ jobs:
           packages: "platform-tools ndk;28.2.13676358"
 
       - name: Restore signing key
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        if: ${{ env.KEYSTORE_BASE64 != '' && env.KEYSTORE_PASSWORD != '' && env.KEY_ALIAS != '' && env.KEY_PASSWORD != '' }}
         run: |
           echo "$KEYSTORE_BASE64" | base64 -d > ${{ github.workspace }}/release.jks
           cat >> local.properties <<EOF
@@ -94,19 +94,19 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build PRoot runtime
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        if: ${{ env.KEYSTORE_BASE64 != '' && env.KEYSTORE_PASSWORD != '' && env.KEY_ALIAS != '' && env.KEY_PASSWORD != '' }}
         run: |
           chmod +x ./build-proot.sh
           ./build-proot.sh
 
       - name: Build F-Droid Release APK
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        if: ${{ env.KEYSTORE_BASE64 != '' && env.KEYSTORE_PASSWORD != '' && env.KEY_ALIAS != '' && env.KEY_PASSWORD != '' }}
         run: |
           chmod +x ./gradlew
           ./gradlew assembleFdroidRelease
 
       - name: Verify PRoot runtime packaging
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        if: ${{ env.KEYSTORE_BASE64 != '' && env.KEYSTORE_PASSWORD != '' && env.KEY_ALIAS != '' && env.KEY_PASSWORD != '' }}
         run: |
           apk_path=$(find app/build/outputs/apk/fdroid/release -name '*.apk' -print -quit)
           test -n "$apk_path"
@@ -122,7 +122,7 @@ jobs:
           done
 
       - name: Upload signed release APK
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        if: ${{ env.KEYSTORE_BASE64 != '' && env.KEYSTORE_PASSWORD != '' && env.KEY_ALIAS != '' && env.KEY_PASSWORD != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: agentx-fdroid-release
