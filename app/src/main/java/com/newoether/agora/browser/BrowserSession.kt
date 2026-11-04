@@ -158,7 +158,7 @@ class BrowserSession(
 
     // ── page primitives (all require ensureConnected() first) ──
 
-    /** Navigate and wait for load (fail-open: returns loaded=false on timeout). */
+    /** Navigate and wait for load. A timeout is not a successful navigation. */
     suspend fun navigate(url: String, timeoutMs: Long): Boolean {
         // Subscribe before navigating so the load event cannot be missed.
         val loadEvent = scope.async(Dispatchers.Default) {
@@ -166,12 +166,20 @@ class BrowserSession(
                 cdp.events.filter { it.method == "Page.loadEventFired" }.first()
             }
         }
-        cdp.invoke(
-            method = "Page.navigate",
-            params = buildJsonObject { put("url", url) },
-            timeoutMs = timeoutMs,
-        )
-        return loadEvent.await() != null
+        try {
+            val result = cdp.invoke(
+                method = "Page.navigate",
+                params = buildJsonObject { put("url", url) },
+                timeoutMs = timeoutMs,
+            )
+            val errorText = (result["errorText"] as? JsonPrimitive)?.contentOrNull
+            if (!errorText.isNullOrBlank()) {
+                throw com.newoether.agora.browser.cdp.CdpException("navigation_failed:$errorText")
+            }
+            return loadEvent.await() != null
+        } finally {
+            loadEvent.cancel()
+        }
     }
 
     suspend fun axSnapshot(timeoutMs: Long): JsonObject =

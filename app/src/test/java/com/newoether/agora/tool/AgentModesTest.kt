@@ -214,7 +214,7 @@ class AgentModesTest {
 
     @Test
     fun ensembleTool_modelsParam_overridesPreset() {
-        val asked = mutableListOf<String>()
+        val asked = java.util.concurrent.ConcurrentLinkedQueue<String>()
         val fake: LlmProvider = mockk()
         every { fake.generateResponse(any(), any()) } answers {
             asked.add(secondArg<ProviderConfig>().modelId)
