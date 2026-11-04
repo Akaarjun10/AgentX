@@ -168,9 +168,13 @@ class BrowserToolProvider(
                 "browser_download_status" -> downloadStatus()
                 else -> return@withContext errorJson(name, "unknown_tool", "Unknown tool: $name")
             }
+            val parsedOutcome = runCatching { json.parseToJsonElement(outcome.json) as? JsonObject }.getOrNull()
+            val outcomeError = (parsedOutcome?.get("error") as? JsonPrimitive)?.contentOrNull
             BrowserDiagnostics.record(
                 ctx, outcome.action,
-                SystemClock.elapsedRealtime() - started, "ok", outcome.extra,
+                SystemClock.elapsedRealtime() - started,
+                if (outcomeError == null) "ok" else "error:$outcomeError",
+                outcome.extra,
             )
             outcome.json
         } catch (e: Exception) {
@@ -253,13 +257,20 @@ class BrowserToolProvider(
             return ActionOutcome("navigate", errorJson("browser_navigate", "not_connected", ""))
         }
         val loaded = session.navigate(url, ctx.toolTimeoutMs)
+        if (!loaded) {
+            return ActionOutcome(
+                "navigate",
+                errorJson("browser_navigate", "navigation_timeout", "Page load did not complete before the navigation deadline."),
+                mapOf("domain" to hostOf(url), "backend" to (session.currentBackendMode()?.persisted ?: "-")),
+            )
+        }
         return ActionOutcome(
             "navigate",
             buildJsonObject {
                 put("type", "browser")
                 put("tool", "browser_navigate")
                 put("ok", true)
-                put("loaded", loaded)
+                put("loaded", true)
             }.toString(),
             mapOf(
                 "domain" to hostOf(url),
